@@ -1,4 +1,4 @@
-# go-profiling-demo
+# go-otel-demo
 One simple go app for [DataKit](https://www.guance.com) continuous profiling demonstrating
 
 ## 宿主机运行
@@ -6,7 +6,7 @@ One simple go app for [DataKit](https://www.guance.com) continuous profiling dem
 ### 构建
 
 ```shell
-$ cd go-profiling-demo
+$ cd go-otel-demo
 $ go mod tidy
 $ go build
 ```
@@ -18,10 +18,10 @@ $ DD_TRACE_ENABLED=true \
 DD_PROFILING_ENABLED=true \
 DD_AGENT_HOST=127.0.0.1 \
 DD_TRACE_AGENT_PORT=9529 \
-DD_SERVICE=go-profiling-demo \
+DD_SERVICE=go-otel-demo \
 DD_ENV=demo \
 DD_VERSION=v0.0.1 \
-./go-profiling-demo
+./go-otel-demo
 ```
 
 ### 验证运行状态
@@ -82,9 +82,9 @@ $ curl 'http://127.0.0.1:8080/movies?q=spider' | jq
 ## Docker 下运行
 
 ```shell
-$ docker build --build-arg DK_DATAWAY=<your-dataway-endpoint> -t go-profiling-demo .
-$ docker run -d go-profiling-demo
+$ docker build --build-arg DK_DATAWAY=<your-dataway-endpoint> -t go-otel-demo .
+$ docker run -d go-otel-demo
 ```
 
 > DK_DATAWAY可以从观测云空间 [集成 -> Datakit](https://console.guance.com/integration/datakit) 页面上复制，例如：
-> docker build --build-arg DK_DATAWAY=https://openway.guance.com?token=tkn_f5b2989ba6ab44bc988cf7e2aa4a6de3 -t go-profiling-demo .
+> docker build --build-arg DK_DATAWAY=https://openway.guance.com?token=tkn_f5b2989ba6ab44bc988cf7e2aa4a6de3 -t go-otel-demo .

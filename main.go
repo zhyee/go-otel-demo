@@ -2,14 +2,18 @@ package main
 
 import (
 	"compress/gzip"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"gopkg.in/DataDog/dd-trace-go.v1/ddtrace"
+	"go.opentelemetry.io/otel/sdk/resource"
+	semconv "go.opentelemetry.io/otel/semconv/v1.10.0"
 	"io"
 	"log"
 	"net/http"
 	"net/http/pprof"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"runtime"
 	"sort"
@@ -17,23 +21,31 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
+	"github.com/GuanceCloud/oteldatadogtie"
+	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
-	"gopkg.in/DataDog/dd-trace-go.v1/ddtrace/tracer"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetricgrpc"
+	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
+	otelmetric "go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/sdk/metric"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/trace"
 	"gopkg.in/DataDog/dd-trace-go.v1/profiler"
 )
 
-const BaseServiceName = "go-profiling-demo"
-
-type ctxKeyStruct struct {
-}
-
-var serviceNameKey = ctxKeyStruct{}
+const BaseServiceName = "go-otel-demo"
 
 var serviceId = func() *atomic.Int64 {
 	return &atomic.Int64{}
 }()
+
+var tracer trace.Tracer
 
 func resetServiceID() {
 	serviceId.Store(0)
@@ -55,14 +67,6 @@ func getCurServName() string {
 func getNextServName() string {
 	return fmt.Sprintf("%s-%s", BaseServiceName, getNextServID())
 }
-
-var movies = func() []Movie {
-	movies, err := readMovies()
-	if err != nil {
-		panic(err)
-	}
-	return movies
-}()
 
 type Movie struct {
 	Title       string  `json:"title"`
@@ -115,10 +119,13 @@ func isENVTrue(key string) bool {
 	return true
 }
 
-func sendHtmlRequest(ctx ddtrace.SpanContext, bodyText string, servName string) {
-	newSpan := tracer.StartSpan(GetCallerFuncName(), tracer.ChildOf(ctx),
-		tracer.ServiceName(servName))
-	defer newSpan.Finish()
+func sendHtmlRequest(ctx context.Context, bodyText string, servName string) {
+	_, span := tracer.Start(ctx, GetCallerFuncName(),
+		trace.WithSpanKind(trace.SpanKindClient),
+		trace.WithAttributes(attribute.String("service.name", servName)),
+		trace.WithTimestamp(time.Now()),
+		trace.WithLinks())
+	defer span.End()
 
 	req, err := http.NewRequest(http.MethodGet, "https://tv189.com/", strings.NewReader(strings.Repeat(bodyText, 1000)))
 
@@ -140,10 +147,10 @@ func sendHtmlRequest(ctx ddtrace.SpanContext, bodyText string, servName string) 
 		return
 	}
 
-	log.Println(string(body))
+	log.Println("response body len: ", len(body))
 }
 
-func fibonacci(ctx ddtrace.SpanContext, n int, servName string) int {
+func fibonacci(ctx context.Context, n int, servName string) int {
 	if n <= 2 {
 		return 1
 	}
@@ -155,18 +162,22 @@ func fibonacci(ctx ddtrace.SpanContext, n int, servName string) int {
 	return fibonacci(ctx, n-1, servName) + fibonacci(ctx, n-2, servName)
 }
 
-func fibonacciWithTrace(ctx ddtrace.SpanContext, n int, servName string) int {
-	span := tracer.StartSpan(GetCallerFuncName(), tracer.ChildOf(ctx),
-		tracer.ServiceName(servName))
-	defer span.Finish()
-	return fibonacci(span.Context(), n-1, servName) + fibonacci(span.Context(), n-2, servName)
+func fibonacciWithTrace(ctx context.Context, n int, servName string) int {
+	var newCtx context.Context
+	var span trace.Span
+	newCtx, span = tracer.Start(ctx, GetCallerFuncName(), trace.WithAttributes(attribute.Int("n", n),
+		attribute.String("service.name", servName)))
+	defer span.End()
+
+	return fibonacci(newCtx, n-1, servName) + fibonacci(newCtx, n-2, servName)
 }
 
-func httpReqWithTrace(ctx ddtrace.SpanContext) {
-	span := tracer.StartSpan(GetCallerFuncName(), tracer.ChildOf(ctx),
-		tracer.ServiceName(getNextServName()),
-	)
-	defer span.Finish()
+func httpReqWithTrace(ctx context.Context) {
+	var newCtx context.Context
+	var span trace.Span
+	newCtx, span = tracer.Start(ctx, GetCallerFuncName(),
+		trace.WithAttributes(attribute.String("service.name", getNextServName())))
+	defer span.End()
 
 	bodyText := `
 黄河远上白云间，一片孤城万仞山。
@@ -176,21 +187,89 @@ func httpReqWithTrace(ctx ddtrace.SpanContext) {
 `
 
 	for i := 0; i < 10; i++ {
-		sendHtmlRequest(span.Context(), bodyText, getCurServName())
+		sendHtmlRequest(newCtx, bodyText, getCurServName())
 	}
 }
 
 func main() {
+	log.SetFlags(log.LstdFlags | log.Lshortfile)
 
-	if isENVTrue("DD_TRACE_ENABLED") {
-		tracer.Start(
-			tracer.WithUniversalVersion("v0.8.888"),
-		)
-		defer tracer.Stop()
+	ctx := context.Background()
+
+	exporter, err := otlptracegrpc.New(ctx,
+		otlptracegrpc.WithInsecure(),
+		//otlptracegrpc.WithEndpoint("localhost:4317"),
+	)
+
+	//exporter, err := otlptracehttp.New(ctx,
+	//	otlptracehttp.WithEndpointURL("http://127.0.0.1:9529/otel/v1/trace"),
+	//	otlptracehttp.WithInsecure(),
+	//	otlptracehttp.WithCompression(otlptracehttp.NoCompression),
+	//)
+	if err != nil {
+		log.Fatalf("unable to init exporter: %v \n", err)
 	}
 
+	tp := sdktrace.NewTracerProvider(
+		sdktrace.WithResource(
+			resource.NewSchemaless(
+				//attribute.String("service.name", getNextServName()),
+				semconv.ServiceNameKey.String(getCurServName()),
+				semconv.ServiceVersionKey.String("v3.4.55"),
+			),
+		),
+		sdktrace.WithBatcher(exporter, sdktrace.WithBatchTimeout(time.Second*5)),
+	)
+
+	tp2 := oteldatadogtie.Wrap(tp)
+	defer tp2.Shutdown(ctx)
+
+	//tp := oteldatadogtie.NewTracerProvider(sdktrace.WithBatcher(exporter, sdktrace.WithBatchTimeout(time.Second)))
+	//defer tp.Shutdown(ctx)
+
+	otel.SetTracerProvider(tp2)
+	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(propagation.TraceContext{}, propagation.Baggage{}))
+	otel.SetErrorHandler(otel.ErrorHandlerFunc(func(err error) {
+		log.Println("otel encounters error: ", err)
+	}))
+
+	tracer = otel.Tracer("go-otel-demo",
+		trace.WithInstrumentationAttributes(attribute.String("service.name", BaseServiceName)),
+		trace.WithInstrumentationVersion("v3.4.99"),
+	)
+
+	//metricExporter, err := stdoutmetric.New(stdoutmetric.WithPrettyPrint())
+
+	metricExporter, err := otlpmetricgrpc.New(ctx,
+		otlpmetricgrpc.WithInsecure(),
+		//otlpmetricgrpc.WithEndpoint("localhost:4317"),
+	)
+
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	metricProvider := metric.NewMeterProvider(
+		metric.WithReader(metric.NewPeriodicReader(metricExporter, metric.WithInterval(time.Second*15))))
+
+	defer metricProvider.Shutdown(context.Background())
+
+	otel.SetMeterProvider(metricProvider)
+
+	meter := otel.Meter("otel-metrics")
+
+	reqCounter, err := meter.Int64Counter("request.count", otelmetric.WithDescription("total request count"))
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	reqLatency, err := meter.Float64Histogram("request.latency",
+		otelmetric.WithUnit("s"), otelmetric.WithDescription("req duration statistics"),
+		otelmetric.WithExplicitBucketBoundaries(0.01, 0.05, 0.1, 0.3, 0.5, 1.0),
+	)
+
 	if isENVTrue("DD_PROFILING_ENABLED") {
-		err := profiler.Start(
+		options := []profiler.Option{
 			profiler.WithProfileTypes(
 				profiler.CPUProfile,
 				profiler.HeapProfile,
@@ -202,7 +281,15 @@ func main() {
 				profiler.GoroutineProfile,
 				profiler.MetricsProfile,
 			),
-		)
+			//profiler.WithAgentAddr("127.0.0.1:9529"),
+			profiler.WithService("go-otel-demo"),
+			profiler.WithEnv("pre-release"),
+			profiler.WithVersion("v0.1.2"),
+		}
+
+		options = append(options, profiler.WithTags(oteldatadogtie.TagRuntimeID))
+
+		err := profiler.Start(options...)
 
 		if err != nil {
 			log.Fatal(err)
@@ -212,81 +299,101 @@ func main() {
 	}
 
 	router := gin.New()
-	//router.Use(gintrace.Middleware("go-profiling-demo"))
+	//router.Use(gintrace.Middleware("go-otel-demo"))
+
+	// Access-Control-*
+	router.Use(cors.New(cors.Config{
+		AllowAllOrigins:  true,
+		AllowMethods:     []string{"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"},
+		AllowCredentials: true,
+		AllowHeaders:     []string{"*"},
+		MaxAge:           time.Hour * 24,
+	}))
 
 	router.GET("/movies", func(ctx *gin.Context) {
+		log.Println("headers: ")
+		for k, v := range ctx.Request.Header {
+			log.Printf("%s:%s\n", k, strings.Join(v, ","))
+		}
+
+		start := time.Now()
+
 		resetServiceID()
 
-		spanCtx, err := tracer.Extract(tracer.HTTPHeadersCarrier(ctx.Request.Header))
-		if err != nil {
-			log.Printf("unable to extract span context from request header: %s", err)
-		}
+		reqCounter.Add(ctx, 1, otelmetric.WithAttributes(attribute.String("request-uri", ctx.Request.RequestURI)))
 
-		if spanCtx != nil {
-			spanCtx.ForeachBaggageItem(func(k, v string) bool {
-				log.Printf("span context extracted key value %s: %s\n", k, v)
-				return true
-			})
-		}
+		defer func() {
+			statusCode := ctx.Writer.Status()
+			reqLatency.Record(ctx, time.Since(start).Seconds(), otelmetric.WithAttributes(attribute.Int("http-status-code", statusCode)))
+		}()
 
-		span := tracer.StartSpan("get_movies", tracer.ChildOf(spanCtx),
-			tracer.ServiceName(getNextServName()))
-		defer span.Finish()
+		var newCtx context.Context
+
+		otelCtx := otel.GetTextMapPropagator().Extract(ctx.Request.Context(), propagation.HeaderCarrier(ctx.Request.Header))
+
+		var span trace.Span
+		newCtx, span = tracer.Start(otelCtx, "get_movies",
+			trace.WithAttributes(attribute.String("service", getNextServName())))
+		defer span.End()
 
 		var wg sync.WaitGroup
 		wg.Add(2)
 
-		go func(ctx ddtrace.SpanContext) {
-
+		go func(ctx context.Context) {
 			defer wg.Done()
-			param := 42
+			param := 40
 			log.Printf("fibonacci(%d) = %d\n", param, fibonacci(ctx, param, getNextServName()))
-		}(span.Context())
+			log.Printf("fibonacci(%d) = %d\n", param, fibonacci(ctx, param, getNextServName()))
+		}(newCtx)
 
-		go func(ctx ddtrace.SpanContext) {
+		go func(ctx context.Context) {
 			defer wg.Done()
 			httpReqWithTrace(ctx)
-		}(span.Context())
+		}(newCtx)
 
 		q := ctx.Request.FormValue("q")
 
-		moviesCopy := make([]Movie, len(movies))
-		copy(moviesCopy, movies)
+		movies, err := readMovies()
+		if err != nil {
+			log.Println("unable to read movies:", err)
+			ctx.Writer.WriteHeader(http.StatusInternalServerError)
+			return
+		}
 
-		func() {
-			request, err := http.NewRequestWithContext(tracer.ContextWithSpan(ctx.Request.Context(), span),
-				http.MethodPost, "http://127.0.0.1:5888/foobar", nil)
-			if err != nil {
-				log.Println("unable to new request: ", err)
-				return
-			}
-			err = tracer.Inject(span.Context(), tracer.HTTPHeadersCarrier(request.Header))
-			if err != nil {
-				log.Println("unable to inject span to request: ", err)
-				return
-			}
-			resp, err := http.DefaultClient.Do(request)
-			if err != nil {
-				log.Println("unable to request go-http-client")
-				return
-			}
-			defer resp.Body.Close()
+		//func() {
+		//	request, err := http.NewRequestWithContext(tracer.ContextWithSpan(ctx.Request.Context(), span),
+		//		http.MethodPost, "http://127.0.0.1:5888/foobar", nil)
+		//	if err != nil {
+		//		log.Println("unable to new request: ", err)
+		//		return
+		//	}
+		//	err = tracer.Inject(span.Context(), tracer.HTTPHeadersCarrier(request.Header))
+		//	if err != nil {
+		//		log.Println("unable to inject span to request: ", err)
+		//		return
+		//	}
+		//	resp, err := http.DefaultClient.Do(request)
+		//	if err != nil {
+		//		log.Println("unable to request go-http-client")
+		//		return
+		//	}
+		//	defer resp.Body.Close()
+		//
+		//	body, err := io.ReadAll(resp.Body)
+		//	if err != nil {
+		//		log.Println("unable to read request body: ", err)
+		//	}
+		//
+		//	fmt.Println("response: ", string(body))
+		//}()
 
-			body, err := io.ReadAll(resp.Body)
-			if err != nil {
-				log.Println("unable to read request body: ", err)
-			}
-
-			fmt.Println("response: ", string(body))
-		}()
-
-		sort.Slice(moviesCopy, func(i, j int) bool {
+		sort.Slice(movies, func(i, j int) bool {
 			time.Sleep(time.Microsecond * 10)
-			t1, err := time.Parse("2006-01-02", moviesCopy[i].ReleaseDate)
+			t1, err := time.Parse("2006-01-02", movies[i].ReleaseDate)
 			if err != nil {
 				return false
 			}
-			t2, err := time.Parse("2006-01-02", moviesCopy[j].ReleaseDate)
+			t2, err := time.Parse("2006-01-02", movies[j].ReleaseDate)
 			if err != nil {
 				return true
 			}
@@ -296,17 +403,18 @@ func main() {
 		if q != "" {
 			q = strings.ToUpper(q)
 			matchCount := 0
-			for idx, m := range moviesCopy {
+			for idx, m := range movies {
 				if strings.Contains(strings.ToUpper(m.Title), q) && idx != matchCount {
-					moviesCopy[matchCount] = moviesCopy[idx]
+					movies[matchCount] = movies[idx]
 					matchCount++
 				}
 			}
-			moviesCopy = moviesCopy[:matchCount]
+			movies = movies[:matchCount]
 		}
 
 		encoder := json.NewEncoder(ctx.Writer)
-		if err := encoder.Encode(moviesCopy); err != nil {
+		encoder.SetIndent("", "    ")
+		if err := encoder.Encode(movies); err != nil {
 			log.Printf("encode into json fail: %s", err)
 			ctx.Writer.WriteHeader(http.StatusInternalServerError)
 		}
@@ -337,7 +445,27 @@ func main() {
 		pprof.Trace(ctx.Writer, ctx.Request)
 	})
 
-	if err := http.ListenAndServe(":8080", router); err != nil {
+	serv := &http.Server{
+		Addr:    ":8080",
+		Handler: router,
+	}
+
+	go func() {
+		sig := make(chan os.Signal, 16)
+		signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM, os.Interrupt)
+		<-sig
+		newCtx, fn := context.WithTimeout(context.Background(), 5*time.Second)
+		defer fn()
+		if err := serv.Shutdown(newCtx); err != nil {
+			log.Println("unable to close http server: ", err)
+		}
+	}()
+
+	if err = serv.ListenAndServe(); err != nil {
+		if errors.Is(err, http.ErrServerClosed) {
+			log.Println("http server closed")
+			return
+		}
 		log.Fatal(err)
 	}
 }

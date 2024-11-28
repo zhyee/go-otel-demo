@@ -1,0 +1,18 @@
+version: "3"
+services:
+  datakit:
+#    image: pubrepo.jiagouyun.com/datakit/datakit:1.9.2
+    image: pubrepo.jiagouyun.com/datakit/datakit:1.8.0-139-g3f912db90d
+#    ports:
+#      - "9529:9529"
+    container_name: datakit
+    environment:
+      ENV_DATAWAY: "https://openway.guance.com?token=tkn_f5b2989ba6ab44bc988cf7e2aa4a6de3"
+      ENV_LOG_LEVEL: "debug"
+      ENV_LOG: "/var/log/datakit/log"
+      ENV_GIN_LOG: "/var/log/datakit/gin.log"
+      ENV_LOG_ROTATE_BACKUP: 3  # 最多保留三个日志文件
+      ENV_LOG_ROTATE_SIZE_MB: 1 # 每个日志文件大小达到 1Mb时进行切割
+      ENV_ENABLE_ELECTION: "enable"
+      ENV_HTTP_LISTEN: "0.0.0.0:9529"
+      ENV_DEFAULT_ENABLED_INPUTS: "rum,profile,ddtrace,host_processes,disk,cpu,mem,swap,system,prom,net,swap"
